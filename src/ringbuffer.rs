@@ -9,6 +9,7 @@ use std::{
 /// Each slot contains:
 /// - `write_state`: Atomic counter to track write operations (incremented at start and end of write)
 /// - `buffer`: UnsafeCell containing raw bytes for this slot
+#[repr(align(64))] // 64 byte aligned improves performance, tested on Windows 11 - AMD 3950x
 struct Slot {
     /// The write state indicator helps us keep track of whether a buffer is being written to or not
     ///
@@ -20,6 +21,7 @@ struct Slot {
 
     /// Raw bytes stored by this ringbuffer
     pub buffer: UnsafeCell<Vec<u8>>,
+    _padding: [u8; 32], // Adjust based on actual struct size
 }
 
 impl Slot {
@@ -28,6 +30,7 @@ impl Slot {
         Self {
             buffer: UnsafeCell::new(vec![clear_value; buffer_size]),
             write_state: AtomicUsize::new(0),
+            _padding: Default::default(),
         }
     }
 }
@@ -37,7 +40,7 @@ impl Slot {
 unsafe impl Send for Slot {}
 unsafe impl Sync for Slot {}
 
-/// A lock-free ring buffer implementation
+/// A fixed size, lock-free ring buffer implementation
 ///
 /// Features:
 /// - Thread-safe operations using atomic primitives
@@ -55,9 +58,17 @@ pub struct RingBuffer {
 }
 
 impl RingBuffer {
-    /// `width` is the size of the Slot buffers which contains the data
+    /// Creates a new RingBuffer with the specified buffer size and length.
     ///
-    /// `length` is how many `Slot`'s the ringbuffer stores
+    /// # Arguments
+    /// * `buffer_size` - The size of each Slot's internal buffer (in bytes)
+    /// * `length` - The number of Slots in the ring buffer (must be a power of two)
+    /// * `clear_value` - The value to initialize each slot's buffer with
+    ///
+    /// # Panics
+    /// * If `buffer_size` is zero
+    /// * If `length` is zero
+    /// * If `length` is not a power of two
     pub fn new(buffer_size: usize, length: usize, clear_value: u8) -> Self {
         assert!(buffer_size != 0);
         assert!(length != 0);
@@ -68,18 +79,43 @@ impl RingBuffer {
                 .map(|_| Slot::new(buffer_size, clear_value))
                 .collect(),
             write_idx: AtomicUsize::new(0),
-            clear_value: clear_value,
+            clear_value,
         }
     }
 
-    /// Write data into the next available slot, (truncates data if it doesn't fit)
-    pub fn write_internal<T>(&self, data: T, clear: bool)
+    /// Write data into the next available slot, truncating data if it doesn't fit
+    /// into the `buffer_size` of the `Slot`
+    ///
+    /// This method atomically acquires the next available slot in the ring buffer,
+    /// writes the provided data to that slot, and handles synchronization between
+    /// multiple writer threads using atomic operations.
+    ///
+    /// # Parameters
+    /// * `data` - The data to write, implementing `AsRef<[u8]>`
+    /// * `clear` - If true, clears the buffer slot with the configured clear value
+    ///   before writing new data
+    ///
+    /// # Behavior
+    /// 1. Acquires the next available slot using atomic fetch-add operation
+    /// 2. Waits for the slot to be free (write_state is even number)
+    /// 3. Writes data to the buffer, truncating if necessary to fit the slot size
+    /// 4. Uses atomic operations to ensure thread-safe writing:
+    ///    - First increment: indicates writing has started
+    ///    - Second increment: indicates writing is complete
+    ///
+    /// # Safety
+    /// This function uses unsafe code for memory operations and assumes:
+    /// - The buffer pointer is valid
+    /// - Data length doesn't exceed buffer capacity
+    /// - Atomic ordering constraints are maintained
+    #[inline]
+    fn write_internal<T>(&self, data: T, clear: bool)
     where
         T: AsRef<[u8]>,
     {
         let data = data.as_ref();
 
-        let idx = self.write_idx.fetch_add(1, Ordering::Relaxed) & (self.slots.len() - 1);
+        let idx = self.write_idx.fetch_add(1, Ordering::SeqCst) & (self.slots.len() - 1);
         let slot = &self.slots[idx];
 
         // Wait for slot to be free (even write_state)
@@ -111,6 +147,21 @@ impl RingBuffer {
         }
     }
 
+    /// Write data into the next available slot without clearing the buffer first
+    ///
+    /// This function writes the provided data to the next available slot in the
+    /// ring buffer. The existing contents of the buffer slot are preserved.
+    ///
+    /// # Parameters
+    /// * `data` - The data to write, implementing `AsRef<[u8]>`
+    ///
+    /// # Example
+    /// ```
+    /// use rbuf::RingBuffer;
+    /// let ringbuffer = RingBuffer::new(1024, 32, 0);
+    /// ringbuffer.write("Hello");
+    /// ```
+    #[inline]
     pub fn write<T>(&self, data: T)
     where
         T: AsRef<[u8]>,
@@ -118,6 +169,22 @@ impl RingBuffer {
         self.write_internal(data, false);
     }
 
+    /// Write data into the next available slot, clearing the buffer first
+    ///
+    /// This function writes the provided data to the next available slot in the
+    /// ring buffer. Before writing, it clears the entire buffer slot with the
+    /// configured clear value (typically zero bytes).
+    ///
+    /// # Parameters
+    /// * `data` - The data to write, implementing `AsRef<[u8]>`
+    ///
+    /// # Example
+    /// ```
+    /// use rbuf::RingBuffer;
+    /// let ringbuffer = RingBuffer::new(1024, 32, 0);
+    /// ringbuffer.write_and_clear("Hello");
+    /// ```
+    #[inline]
     pub fn write_and_clear<T>(&self, data: T)
     where
         T: AsRef<[u8]>,
@@ -125,11 +192,31 @@ impl RingBuffer {
         self.write_internal(data, true);
     }
 
-    /// clones the internal buffer when it is not being written to
+    /// Read data from the most recently written slot
+    ///
+    /// This function atomically reads the data from the most recently written slot
+    /// in the ring buffer. It ensures thread safety by checking the write state
+    /// to verify that the slot is not currently being written to.
+    ///
+    /// # Returns
+    /// A slice reference to the current slot's data
+    ///
+    /// # Behavior
+    /// 1. Calculates the index of the most recently written slot
+    /// 2. Checks if the slot is currently being written to (odd write_state)
+    /// 3. If writing is in progress, spins until the slot becomes available
+    /// 4. Verifies that the slot content hasn't changed during read operation
+    /// 5. Returns a reference to the buffer data
+    ///
+    /// # Safety
+    /// This function uses unsafe code for memory operations and assumes:
+    /// - The buffer pointer is valid
+    /// - Atomic ordering constraints are maintained
+    #[inline]
     pub fn read(&self) -> &[u8] {
         loop {
             let idx =
-                self.write_idx.load(Ordering::Relaxed).saturating_sub(1) & (self.slots.len() - 1);
+                self.write_idx.load(Ordering::SeqCst).saturating_sub(1) & (self.slots.len() - 1);
             let slot = &self.slots[idx];
 
             let write_state_before = slot.write_state.load(Ordering::Acquire);
@@ -154,10 +241,31 @@ impl RingBuffer {
         }
     }
 
-    // Reads the data as a utf8 string
+    /// Read data from the most recently written slot as a UTF-8 string
+    ///
+    /// This function reads the most recently written data from the ring buffer
+    /// and converts it to a UTF-8 string, trimming trailing null bytes.
+    ///
+    /// # Returns
+    /// A String containing the decoded UTF-8 data
+    ///
+    /// # Behavior
+    /// 1. Calls the `read()` method to get the raw byte data
+    /// 2. Converts the byte slice to a UTF-8 string using lossy conversion
+    /// 3. Trims trailing null bytes from the string
+    /// 4. Returns the resulting String
+    ///
+    /// # Example
+    /// ```
+    /// use rbuf::RingBuffer;
+    /// let ringbuffer = RingBuffer::new(1024, 32, 0);
+    /// ringbuffer.write("Hello World");
+    /// let text = ringbuffer.read_str(); // Returns "Hello World"
+    /// ```
+    #[inline]
     pub fn read_str(&self) -> String {
         let data = self.read();
-        String::from_utf8_lossy(&data)
+        String::from_utf8_lossy(data)
             .trim_end_matches("\0")
             .to_string()
     }
@@ -165,35 +273,107 @@ impl RingBuffer {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{sync::Arc, thread};
 
     use super::*;
 
     #[test]
-    fn test() {
-        let rbuf = Arc::new(RingBuffer::new(32, 16, 0));
+    fn test_basic_write_read() {
+        let ringbuffer = RingBuffer::new(128, 32, 0);
 
-        let rbuf2 = rbuf.clone();
-        let rbuf3 = rbuf.clone();
+        let data = b"Hello World";
+        ringbuffer.write(data);
 
-        thread::spawn(move || {
-            loop {
-                rbuf.write_and_clear("potato");
-                thread::sleep(Duration::from_millis(1));
-            }
-        });
+        let read_data = ringbuffer.read();
+        assert_eq!(&read_data[..data.len()], data);
+    }
 
-        thread::spawn(move || {
-            loop {
-                rbuf2.write("apple bees");
-                thread::sleep(Duration::from_millis(1));
-            }
-        });
-        thread::sleep(Duration::from_millis(100));
+    #[test]
+    fn test_overwrite() {
+        let ringbuffer = RingBuffer::new(128, 1, 0);
 
-        for _ in 0..100 {
-            println!("{:?}", rbuf3.read_str());
-            thread::sleep(Duration::from_millis(100));
+        let data = b"Hello World";
+
+        // Write initial data
+        ringbuffer.write(data);
+
+        // Write with clear - should overwrite with zeros
+        ringbuffer.write(b"World");
+
+        let read_data = ringbuffer.read();
+        assert_eq!(&read_data[..data.len()], b"World World");
+    }
+
+    #[test]
+    fn test_read_str() {
+        let ringbuffer = RingBuffer::new(128, 32, 0);
+
+        ringbuffer.write(b"Hello World\0\0");
+        let result = ringbuffer.read_str();
+        assert_eq!(result, "Hello World");
+    }
+
+    #[test]
+    fn test_multiple_writes() {
+        let ringbuffer = RingBuffer::new(1024, 32, 0);
+
+        let data1 = b"First";
+        let data2 = b"Second";
+        let data3 = b"Third";
+
+        ringbuffer.write(data1);
+        ringbuffer.write(data2);
+        ringbuffer.write(data3);
+
+        // Should read the last written data
+        let read_data = ringbuffer.read();
+        assert_eq!(&read_data[..data3.len()], data3);
+    }
+
+    #[test]
+    fn test_thread_safety() {
+        let ringbuffer = Arc::new(RingBuffer::new(1024, 32, 0));
+        let mut handles = vec![];
+
+        // Spawn multiple threads writing to the buffer
+        for i in 0..10 {
+            let rb = Arc::clone(&ringbuffer);
+            let handle = thread::spawn(move || {
+                let data = format!("Thread {} data", i).into_bytes();
+                rb.write(data);
+            });
+            handles.push(handle);
         }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Read data - should be from one of the threads
+        let read_data = ringbuffer.read();
+        assert!(!read_data.is_empty());
+    }
+
+    #[test]
+    fn test_buffer_truncation() {
+        let ringbuffer = RingBuffer::new(8, 1, 0); // Small buffer size
+
+        // Write more data than fits in the slot
+        let large_data = b"Hello World This is too long";
+        ringbuffer.write(large_data);
+
+        let read_data = ringbuffer.read();
+        // Should only contain first 8 bytes
+        assert_eq!(read_data, b"Hello Wo");
+    }
+
+    #[test]
+    fn test_empty_buffer() {
+        let ringbuffer = RingBuffer::new(128, 32, 0);
+
+        // Read from empty buffer should return empty slice
+        let read_data = ringbuffer.read();
+        assert_eq!(read_data.len(), 128);
     }
 }

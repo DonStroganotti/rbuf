@@ -1,1 +1,2 @@
-pub mod ringbuffer;
+mod ringbuffer;
+pub use ringbuffer::RingBuffer;

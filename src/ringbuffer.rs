@@ -2,6 +2,7 @@ use std::{
     cell::UnsafeCell,
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
+    thread,
 };
 
 /// A slot in the ring buffer
@@ -65,6 +66,8 @@ pub struct RingBuffer {
     /// Because the length/slot count has to be a power of 2
     /// then we can use length -1 as a mask to wrap values without modulo %
     mask: usize,
+    /// Slot buffer size
+    buffer_size: usize,
 }
 
 impl RingBuffer {
@@ -91,6 +94,7 @@ impl RingBuffer {
             write_idx: AtomicUsize::new(0),
             clear_value,
             mask: length - 1,
+            buffer_size,
         }
     }
 
@@ -220,6 +224,63 @@ impl RingBuffer {
     /// in the ring buffer. It ensures thread safety by checking the write state
     /// to verify that the slot is not currently being written to.
     ///
+    /// # Behavior
+    /// 1. Calculates the index of the most recently written slot
+    /// 2. Checks if the slot is currently being written to (odd write_state)
+    /// 3. If writing is in progress, spins until the slot becomes available
+    /// 4. Writes data to the output_buffer
+    /// 5. Verifies that the slot content hasn't changed during read operation, if not it will try to read the data again
+    ///
+    /// # Safety
+    /// This function uses unsafe code for memory operations and assumes:
+    /// - The buffer pointer is valid
+    /// - Atomic ordering constraints are maintained
+    /// ## Note:
+    /// - This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,
+    ///   rather than systems requiring guaranteed delivery of every single write.
+    /// - Readers should expect to see the most recently written data, but may miss intermediate writes
+    ///   if the writer outpaces the reader.
+    #[inline]
+    pub fn read_to_buf(&self, output_buffer: &mut Vec<u8>) {
+        // Loop until we are able to fully read the buffer
+        loop {
+            // write index - 1 is the last written to Slot
+            let idx = self.write_idx.load(Ordering::Acquire).wrapping_sub(1) & self.mask;
+            let slot = &self.slots[idx];
+
+            let write_state_before = slot.write_state.load(Ordering::Acquire);
+
+            // uneven means the slot it is currently being written to
+            if !write_state_before.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let buffer = slot.buffer.get();
+
+            // Read from buffer
+            unsafe {
+                // store the return data before checking write state as it is possible a write happens during the clone.
+                output_buffer
+                    .as_mut_ptr()
+                    .copy_from_nonoverlapping((*buffer).as_mut_ptr(), self.buffer_size);
+
+                let write_state_after = slot.write_state.load(Ordering::Acquire);
+
+                // SAFETY: if the write_state hasn't changed we successfully copied all of the data
+                if write_state_before == write_state_after {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Read data from the most recently written slot
+    ///
+    /// This function atomically reads the data from the most recently written slot
+    /// in the ring buffer. It ensures thread safety by checking the write state
+    /// to verify that the slot is not currently being written to.
+    ///
     /// # Returns
     /// A copy of the data in the buffer
     ///
@@ -241,32 +302,9 @@ impl RingBuffer {
     ///   if the writer outpaces the reader.
     #[inline]
     pub fn read(&self) -> Vec<u8> {
-        // Loop until we are able to fully read the buffer
-        loop {
-            // write index - 1 is the last written to Slot
-            let idx = self.write_idx.load(Ordering::Acquire).wrapping_sub(1) & self.mask;
-            let slot = &self.slots[idx];
-
-            let write_state_before = slot.write_state.load(Ordering::Acquire);
-
-            // uneven means the slot it is currently being written to
-            if !write_state_before.is_multiple_of(2) {
-                std::hint::spin_loop();
-                continue;
-            }
-
-            let buffer = slot.buffer.get();
-
-            // Read from buffer
-            unsafe {
-                let write_state_after = slot.write_state.load(Ordering::Acquire);
-
-                // if the write_state hasn't changed we can safely return a fully written value
-                if write_state_before == write_state_after {
-                    return (*buffer).clone();
-                }
-            }
-        }
+        let mut output_buffer: Vec<u8> = vec![self.clear_value; self.buffer_size];
+        self.read_to_buf(&mut output_buffer);
+        output_buffer
     }
 
     /// Read data from the most recently written slot as a UTF-8 string

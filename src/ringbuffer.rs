@@ -144,6 +144,7 @@ impl RingBuffer {
 
             // Write to buffer
             unsafe {
+                let buffer_ptr = (*buffer).as_mut_ptr();
                 let buffer_len = (*buffer).len();
                 // length of the slot buffer is used to prevent overflow when copying data
                 let len = data.len().min(buffer_len);
@@ -151,15 +152,15 @@ impl RingBuffer {
                 // 1. Increment to indicate that we are writing
                 slot.write_state.fetch_add(1, Ordering::Release);
 
-                // if clear is set then overwrite the buffer with clear_value
-                if clear {
-                    ptr::write_bytes((*buffer).as_mut_ptr(), self.clear_value, buffer_len);
+                // 2. Copy data into buffer first
+                ptr::copy_nonoverlapping(data.as_ptr(), buffer_ptr, len);
+
+                // 3. Fill the rest of the buffer with clear_value
+                if clear && len < buffer_len {
+                    ptr::write_bytes(buffer_ptr.add(len), self.clear_value, buffer_len - len);
                 }
 
-                // 2. Copy data to buffer
-                ptr::copy_nonoverlapping(data.as_ptr(), (*buffer).as_mut_ptr(), len);
-
-                // 3. Increment to indicate that we done writing
+                // 4. Increment to indicate that we done writing
                 slot.write_state.fetch_add(1, Ordering::Release);
             }
 
@@ -357,6 +358,20 @@ mod tests {
 
         let read_data = ringbuffer.read();
         assert_eq!(&read_data[..data.len()], data);
+    }
+
+    #[test]
+    fn test_basic_write_and_clear() {
+        let ringbuffer = RingBuffer::new(128, 1, 0);
+
+        let data = "Hello World";
+        ringbuffer.write(data);
+
+        assert_eq!(ringbuffer.read_str(), "Hello World");
+
+        ringbuffer.write_and_clear("Test");
+
+        assert_eq!(ringbuffer.read_str(), "Test");
     }
 
     #[test]

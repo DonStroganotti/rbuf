@@ -42,12 +42,19 @@ unsafe impl Sync for Slot {}
 
 /// A fixed size, lock-free ring buffer implementation
 ///
-/// Features:
+/// ## Features:
 /// - Thread-safe operations using atomic primitives
 /// - No mutexes or locks, but operations may block if multiple threads contend for the same buffer index
 ///   - a sufficiently large ring buffer should almost never have this issue.
 /// - Efficient memory usage with pre-allocated slots
-/// - Clear data pattern for uninitialized slots
+///
+/// ## Note:
+/// - Writing too quickly will result in the index looping back and overwriting old, possibly unread data.
+/// - This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,
+///   rather than systems requiring guaranteed delivery of every single write.
+/// - Readers should expect to see the most recently written data, but may miss intermediate writes
+///   if the writer outpaces the reader.
+///
 pub struct RingBuffer {
     /// Vector of slots that make up the ring buffer
     slots: Vec<Slot>,
@@ -55,6 +62,9 @@ pub struct RingBuffer {
     write_idx: AtomicUsize,
     /// Pattern used to initialize new slots with clear data
     clear_value: u8,
+    /// Because the length/slot count has to be a power of 2
+    /// then we can use length -1 as a mask to wrap values without modulo %
+    mask: usize,
 }
 
 impl RingBuffer {
@@ -80,6 +90,7 @@ impl RingBuffer {
                 .collect(),
             write_idx: AtomicUsize::new(0),
             clear_value,
+            mask: length - 1,
         }
     }
 
@@ -115,35 +126,41 @@ impl RingBuffer {
     {
         let data = data.as_ref();
 
-        let idx = self.write_idx.fetch_add(1, Ordering::SeqCst) & (self.slots.len() - 1);
-        let slot = &self.slots[idx];
+        loop {
+            let idx = self.write_idx.fetch_add(1, Ordering::SeqCst) & self.mask;
+            let slot = &self.slots[idx];
 
-        // Wait for slot to be free (even write_state)
-        while !slot.write_state.load(Ordering::Acquire).is_multiple_of(2) {
-            std::hint::spin_loop();
-        }
-
-        let buffer = slot.buffer.get();
-
-        // Write to buffer
-        unsafe {
-            let buffer_len = (*buffer).len();
-            // length of the slot buffer is used to prevent overflow when copying data
-            let len = data.len().min(buffer_len);
-
-            // 1. Increment to indicate that we are writing
-            slot.write_state.fetch_add(1, Ordering::Release);
-
-            // if clear is set then overwrite the buffer with clear_value
-            if clear {
-                ptr::write_bytes((*buffer).as_mut_ptr(), self.clear_value, buffer_len);
+            // Wait for slot to be free (even write_state)
+            if !slot.write_state.load(Ordering::Acquire).is_multiple_of(2) {
+                std::hint::spin_loop();
+                // Instead of waiting here in a while loop we go back to the start and get a new index or this data will get lost even if it is more recent
+                continue;
             }
 
-            // 2. Copy data to buffer
-            ptr::copy_nonoverlapping(data.as_ptr(), (*buffer).as_mut_ptr(), len);
+            let buffer = slot.buffer.get();
 
-            // 3. Increment to indicate that we done writing
-            slot.write_state.fetch_add(1, Ordering::Release);
+            // Write to buffer
+            unsafe {
+                let buffer_len = (*buffer).len();
+                // length of the slot buffer is used to prevent overflow when copying data
+                let len = data.len().min(buffer_len);
+
+                // 1. Increment to indicate that we are writing
+                slot.write_state.fetch_add(1, Ordering::Release);
+
+                // if clear is set then overwrite the buffer with clear_value
+                if clear {
+                    ptr::write_bytes((*buffer).as_mut_ptr(), self.clear_value, buffer_len);
+                }
+
+                // 2. Copy data to buffer
+                ptr::copy_nonoverlapping(data.as_ptr(), (*buffer).as_mut_ptr(), len);
+
+                // 3. Increment to indicate that we done writing
+                slot.write_state.fetch_add(1, Ordering::Release);
+            }
+
+            break;
         }
     }
 
@@ -161,6 +178,9 @@ impl RingBuffer {
     /// let ringbuffer = RingBuffer::new(1024, 32, 0);
     /// ringbuffer.write("Hello");
     /// ```
+    /// ## Note:
+    /// - Writing too quickly will result in the index looping back and overwriting old, possibly unread data.
+    /// - This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,
     #[inline]
     pub fn write<T>(&self, data: T)
     where
@@ -184,6 +204,9 @@ impl RingBuffer {
     /// let ringbuffer = RingBuffer::new(1024, 32, 0);
     /// ringbuffer.write_and_clear("Hello");
     /// ```
+    /// ## Note:
+    /// - Writing too quickly will result in the index looping back and overwriting old, possibly unread data.
+    /// - This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,
     #[inline]
     pub fn write_and_clear<T>(&self, data: T)
     where
@@ -212,11 +235,15 @@ impl RingBuffer {
     /// This function uses unsafe code for memory operations and assumes:
     /// - The buffer pointer is valid
     /// - Atomic ordering constraints are maintained
+    /// ## Note:
+    /// - This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,
+    ///   rather than systems requiring guaranteed delivery of every single write.
+    /// - Readers should expect to see the most recently written data, but may miss intermediate writes
+    ///   if the writer outpaces the reader.
     #[inline]
     pub fn read(&self) -> &[u8] {
         loop {
-            let idx =
-                self.write_idx.load(Ordering::SeqCst).saturating_sub(1) & (self.slots.len() - 1);
+            let idx = self.write_idx.load(Ordering::SeqCst).saturating_sub(1) & self.mask;
             let slot = &self.slots[idx];
 
             let write_state_before = slot.write_state.load(Ordering::Acquire);
@@ -262,6 +289,11 @@ impl RingBuffer {
     /// ringbuffer.write("Hello World");
     /// let text = ringbuffer.read_str(); // Returns "Hello World"
     /// ```
+    /// ## Note:
+    /// - This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,
+    ///   rather than systems requiring guaranteed delivery of every single write.
+    /// - Readers should expect to see the most recently written data, but may miss intermediate writes
+    ///   if the writer outpaces the reader.
     #[inline]
     pub fn read_str(&self) -> String {
         let data = self.read();

@@ -127,7 +127,7 @@ impl RingBuffer {
         let data = data.as_ref();
 
         loop {
-            let idx = self.write_idx.fetch_add(1, Ordering::SeqCst) & self.mask;
+            let idx = self.write_idx.fetch_add(1, Ordering::AcqRel) & self.mask;
             let slot = &self.slots[idx];
 
             // Wait for slot to be free (even write_state)
@@ -243,7 +243,7 @@ impl RingBuffer {
     #[inline]
     pub fn read(&self) -> Vec<u8> {
         loop {
-            let idx = self.write_idx.load(Ordering::SeqCst).saturating_sub(1) & self.mask;
+            let idx = self.write_idx.load(Ordering::Acquire).saturating_sub(1) & self.mask;
             let slot = &self.slots[idx];
 
             let write_state_before = slot.write_state.load(Ordering::Acquire);

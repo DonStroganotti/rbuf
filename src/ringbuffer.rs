@@ -222,14 +222,14 @@ impl RingBuffer {
     /// to verify that the slot is not currently being written to.
     ///
     /// # Returns
-    /// A slice reference to the current slot's data
+    /// A copy of the data in the buffer
     ///
     /// # Behavior
     /// 1. Calculates the index of the most recently written slot
     /// 2. Checks if the slot is currently being written to (odd write_state)
     /// 3. If writing is in progress, spins until the slot becomes available
     /// 4. Verifies that the slot content hasn't changed during read operation
-    /// 5. Returns a reference to the buffer data
+    /// 5. Returns a copy of the buffer data
     ///
     /// # Safety
     /// This function uses unsafe code for memory operations and assumes:
@@ -241,7 +241,7 @@ impl RingBuffer {
     /// - Readers should expect to see the most recently written data, but may miss intermediate writes
     ///   if the writer outpaces the reader.
     #[inline]
-    pub fn read(&self) -> &[u8] {
+    pub fn read(&self) -> Vec<u8> {
         loop {
             let idx = self.write_idx.load(Ordering::SeqCst).saturating_sub(1) & self.mask;
             let slot = &self.slots[idx];
@@ -262,7 +262,7 @@ impl RingBuffer {
 
                 // if the write_state hasn't changed we can safely return a fully written value
                 if write_state_before == write_state_after {
-                    return &*buffer;
+                    return (*buffer).clone();
                 }
             }
         }
@@ -297,7 +297,7 @@ impl RingBuffer {
     #[inline]
     pub fn read_str(&self) -> String {
         let data = self.read();
-        String::from_utf8_lossy(data)
+        String::from_utf8_lossy(&data)
             .trim_end_matches("\0")
             .to_string()
     }

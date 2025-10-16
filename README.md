@@ -1,11 +1,11 @@
 # rbuf - Lock-Free Ring Buffer
 
-A high-performance, lock-free ring buffer implementation in Rust designed for concurrent access patterns.
+A high-performance, lock-free ring buffer implementation in Rust designed for concurrent access where potential loss of intermediate data is not an issue.
 
 ## Features
 
 - **Thread-Safe**: Uses atomic operations for synchronization without mutexes
-- **Lock-Free**: No blocking operations, uses spin-waiting for contention resolution
+- **Spin-Based**: Uses busy-waiting for contention resolution 
 - **Memory Efficient**: Pre-allocated slots with fixed memory usage
 
 ## Usage
@@ -63,7 +63,6 @@ The implementation uses unsafe code for memory operations but ensures:
 - Thread-safe access through atomic primitives
 - Proper memory layout with alignment
 - Bounds checking during buffer operations
-- Clear data patterns for uninitialized slots
 
 ## Note:
 - This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,

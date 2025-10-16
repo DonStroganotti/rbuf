@@ -132,8 +132,7 @@ impl RingBuffer {
 
             // Wait for slot to be free (even write_state)
             if !slot.write_state.load(Ordering::Acquire).is_multiple_of(2) {
-                std::hint::spin_loop();
-                // Instead of waiting here in a while loop we go back to the start and get a new index or this data will get lost even if it is more recent
+                // Goes back to start of loop to check if the next index is available
                 continue;
             }
 
@@ -242,8 +241,10 @@ impl RingBuffer {
     ///   if the writer outpaces the reader.
     #[inline]
     pub fn read(&self) -> Vec<u8> {
+        // Loop until we are able to fully read the buffer
         loop {
-            let idx = self.write_idx.load(Ordering::Acquire).saturating_sub(1) & self.mask;
+            // write index - 1 is the last written to Slot
+            let idx = self.write_idx.load(Ordering::Acquire).wrapping_sub(1) & self.mask;
             let slot = &self.slots[idx];
 
             let write_state_before = slot.write_state.load(Ordering::Acquire);

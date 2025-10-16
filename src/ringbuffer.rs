@@ -1,8 +1,7 @@
 use std::{
     cell::UnsafeCell,
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
-    thread,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 /// A slot in the ring buffer
@@ -21,25 +20,18 @@ struct Slot {
     write_state: AtomicUsize,
 
     /// Raw bytes stored by this ringbuffer
-    pub buffer: UnsafeCell<Vec<u8>>,
-    _padding: [u8; 32], // Adjust based on actual struct size
+    pub buffer_offset: usize,
 }
 
 impl Slot {
     /// Creates a new slot with the specified buffer size
-    fn new(buffer_size: usize, clear_value: u8) -> Self {
+    fn new(buffer_offset: usize) -> Self {
         Self {
-            buffer: UnsafeCell::new(vec![clear_value; buffer_size]),
+            buffer_offset,
             write_state: AtomicUsize::new(0),
-            _padding: Default::default(),
         }
     }
 }
-
-// Safety: Slot is safe to send between threads because it only contains
-// atomic types and UnsafeCell<Vec<u8>> which is properly synchronized
-unsafe impl Send for Slot {}
-unsafe impl Sync for Slot {}
 
 /// A fixed size, lock-free ring buffer implementation
 ///
@@ -66,9 +58,18 @@ pub struct RingBuffer {
     /// Because the length/slot count has to be a power of 2
     /// then we can use length -1 as a mask to wrap values without modulo %
     mask: usize,
+    // The contiguous buffer - this owns the memory
+    big_buffer: std::cell::UnsafeCell<Vec<u8>>,
     /// Slot buffer size
     buffer_size: usize,
+    /// Boolean indicates if writers that are contending over the same index should drop the data, or try a higher index number
+    writer_drop_on_contention: AtomicBool,
 }
+
+// Safety: RingBuffer is safe to send between threads because memory is never moved or deallocated as long as it exists
+// And all access is guarded by atomic operations
+unsafe impl Send for RingBuffer {}
+unsafe impl Sync for RingBuffer {}
 
 impl RingBuffer {
     /// Creates a new RingBuffer with the specified buffer size and length.
@@ -87,15 +88,50 @@ impl RingBuffer {
         assert!(length != 0);
         assert!(length.is_power_of_two());
 
+        let total_size = length
+            .checked_mul(buffer_size)
+            .expect("Total buffer size overflow");
+
+        // Create the big contiguous buffer
+        let big_buffer = vec![clear_value; total_size];
+
+        // Create slots with their offsets
+        let slots: Vec<Slot> = (0..length).map(|i| Slot::new(i * buffer_size)).collect();
+
         Self {
-            slots: (0..length)
-                .map(|_| Slot::new(buffer_size, clear_value))
-                .collect(),
+            slots,
+            big_buffer: UnsafeCell::new(big_buffer),
             write_idx: AtomicUsize::new(0),
             clear_value,
             mask: length - 1,
             buffer_size,
+            writer_drop_on_contention: AtomicBool::new(false),
         }
+    }
+
+    /// Returns the size of each slot's internal buffer in bytes.
+    pub fn buffer_size(&self) -> usize {
+        self.buffer_size
+    }
+
+    /// Configures whether writers should drop data when contending for the same buffer index
+    ///
+    /// When multiple writers attempt to write to the same slot simultaneously, this setting
+    /// determines the behavior:
+    /// - If `true`: Writers will drop the data and return immediately when contention occurs
+    /// - If `false`: Writers will fetch a new index and try again
+    ///
+    /// This is useful for controlling write performance vs. data loss trade-offs in high-contention scenarios.
+    ///
+    /// # Example
+    /// ```
+    /// use rbuf::RingBuffer;
+    /// let ringbuffer = RingBuffer::new(1024, 32, 0);
+    /// ringbuffer.writer_drop_contended_data(true); // Drop data on contention
+    /// ```
+    pub fn writer_drop_contended_data(&self, value: bool) {
+        self.writer_drop_on_contention
+            .store(value, Ordering::Relaxed);
     }
 
     /// Write data into the next available slot, truncating data if it doesn't fit
@@ -136,18 +172,25 @@ impl RingBuffer {
 
             // Wait for slot to be free (even write_state)
             if !slot.write_state.load(Ordering::Acquire).is_multiple_of(2) {
-                // Goes back to start of loop to check if the next index is available
-                continue;
+                // Because there is no reason to write into the same index as another writer is doing,
+                // our choices are to either increment index again until we find a free one, or drop this data immediately
+                if self.writer_drop_on_contention.load(Ordering::Relaxed) {
+                    return; // drop data
+                } else {
+                    continue; // try to insert at another index
+                }
             }
-
-            let buffer = slot.buffer.get();
 
             // Write to buffer
             unsafe {
-                let buffer_ptr = (*buffer).as_mut_ptr();
-                let buffer_len = (*buffer).len();
+                // Get pointer to this slot's buffer region
+                let buffer_ptr = {
+                    let big_buf = &mut *self.big_buffer.get();
+                    big_buf.as_mut_ptr().add(slot.buffer_offset)
+                };
+
                 // length of the slot buffer is used to prevent overflow when copying data
-                let len = data.len().min(buffer_len);
+                let len = data.len().min(self.buffer_size);
 
                 // 1. Increment to indicate that we are writing
                 slot.write_state.fetch_add(1, Ordering::Release);
@@ -156,8 +199,12 @@ impl RingBuffer {
                 ptr::copy_nonoverlapping(data.as_ptr(), buffer_ptr, len);
 
                 // 3. Fill the rest of the buffer with clear_value
-                if clear && len < buffer_len {
-                    ptr::write_bytes(buffer_ptr.add(len), self.clear_value, buffer_len - len);
+                if clear && len < self.buffer_size {
+                    ptr::write_bytes(
+                        buffer_ptr.add(len),
+                        self.clear_value,
+                        self.buffer_size - len,
+                    );
                 }
 
                 // 4. Increment to indicate that we done writing
@@ -257,14 +304,16 @@ impl RingBuffer {
                 continue;
             }
 
-            let buffer = slot.buffer.get();
-
             // Read from buffer
             unsafe {
+                let buffer_ptr = {
+                    let big_buf = &*self.big_buffer.get();
+                    big_buf.as_ptr().add(slot.buffer_offset)
+                };
                 // store the return data before checking write state as it is possible a write happens during the clone.
                 output_buffer
                     .as_mut_ptr()
-                    .copy_from_nonoverlapping((*buffer).as_mut_ptr(), self.buffer_size);
+                    .copy_from_nonoverlapping(buffer_ptr, self.buffer_size);
 
                 let write_state_after = slot.write_state.load(Ordering::Acquire);
 

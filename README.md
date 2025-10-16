@@ -7,15 +7,13 @@ A high-performance, lock-free ring buffer implementation in Rust designed for co
 - **Thread-Safe**: Uses atomic operations for synchronization without mutexes
 - **Lock-Free**: No blocking operations, uses spin-waiting for contention resolution
 - **Memory Efficient**: Pre-allocated slots with fixed memory usage
-- **Zero-Cost Abstractions**: Optimized for performance-critical applications
-- **Flexible**: Supports both clear and non-clear write modes
 
 ## Usage
 
 ```rust
 use rbuf::RingBuffer;
 
-// Create a ring buffer with 32 slots, each 1024 bytes
+// Create a ring buffer with 32 slots, each 1024 bytes set to 0
 let ringbuffer = RingBuffer::new(1024, 32, 0);
 
 // Write data
@@ -67,10 +65,9 @@ The implementation uses unsafe code for memory operations but ensures:
 - Bounds checking during buffer operations
 - Clear data patterns for uninitialized slots
 
-## Requirements
+## Note:
+- This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,
+rather than systems requiring guaranteed delivery of every single write.
+- Readers should expect to see the most recently written data, but may miss intermediate writes
+if the writer outpaces the reader.
 
-- Target platform supporting atomic operations
-
-## License
-
-MIT License - see LICENSE file for details.

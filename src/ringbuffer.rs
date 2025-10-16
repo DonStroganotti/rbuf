@@ -408,4 +408,40 @@ mod tests {
         let read_data = ringbuffer.read();
         assert_eq!(read_data.len(), 128);
     }
+
+    #[test]
+    fn test_store_struct_pointer() {
+        let ringbuffer = RingBuffer::new(32, 32, 0);
+
+        struct Test {
+            a: u32,
+            b: u32,
+            c: String,
+        }
+
+        let data = Box::into_raw(Box::new(Test {
+            a: 1,
+            b: 5,
+            c: "test".to_string(),
+        }));
+
+        let ptr_value = data as usize;
+
+        let pointer_bytes = ptr_value.to_ne_bytes();
+
+        ringbuffer.write(pointer_bytes);
+
+        let read_bytes = &ringbuffer.read()[..pointer_bytes.len()];
+
+        let ptr_value = usize::from_ne_bytes(read_bytes.try_into().unwrap()) as *mut Test;
+
+        unsafe {
+            assert_eq!((*ptr_value).a, 1);
+            assert_eq!((*ptr_value).b, 5);
+            assert_eq!((*ptr_value).c, "test".to_string());
+
+            // drop pointer
+            let _ = Box::from_raw(ptr_value);
+        }
+    }
 }

@@ -11,8 +11,8 @@ use rbuf::BufferedAtomic;
 use rbuf::RingBuffer;
 
 fn main() {
-    let write_thread_count = 1;
-    let read_thread_count = 1;
+    let write_thread_count = 2;
+    let read_thread_count = 2;
 
     // RingBuffer parameters
     let slot_count = 16;

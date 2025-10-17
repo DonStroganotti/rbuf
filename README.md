@@ -1,72 +1,44 @@
-# rbuf - Lock-Free Ring Buffer
+# rbuf — Buffered Atomics (Lock-Free Concurrent Buffer)
 
-A high-performance, lock-free ring buffer implementation in Rust designed for concurrent access where potential loss of intermediate data is not an issue.
+A high-performance, lock-free buffering library for Rust, designed for concurrent access with minimal overhead and flexible usage patterns.
+
+## Overview
+
+`BufferedAtomics` is a simple, fast, and versatile lock-free buffer implementation for concurrent producers and consumers.  
+It provides atomic read/write access with minimal synchronization overhead, making it ideal for high-throughput systems such as telemetry, streaming, and logging.
+
+---
 
 ## Features
 
-- **Thread-Safe**: Uses atomic operations for synchronization without mutexes
-- **Spin-Based**: Uses busy-waiting for contention resolution 
-- **Memory Efficient**: Pre-allocated slots with fixed memory usage
+- **Thread-Safe** – Built entirely on atomic operations; no locks or mutexes.
+- **Buffered Design** – Efficient handling of concurrent reads/writes.
+- **High Performance** – Optimized memory layout, cache-friendly, minimal contention.
+- **Predictable Memory Usage** – Fixed-size preallocation.
 
-## Usage
+---
+
+## Example Usage
 
 ```rust
-use rbuf::RingBuffer;
+let buffer = Arc::new(BufferedAtomic::new(4));
 
-// Create a ring buffer with 32 slots, each 1024 bytes set to 0
-let ringbuffer = RingBuffer::new(1024, 32, 0);
+let write = buffer.clone();
+let read = buffer.clone();
 
-// Write data
-ringbuffer.write("Hello World");
+let wh = thread::spawn(move || {
+    for i in 0..10 {
+        write.write(format!("Hello reader: {i}"));
+    }
+});
 
-// Read data
-let data = ringbuffer.read();
-let text = ringbuffer.read_str(); // UTF-8 string with null-byte trimming
+let rh = thread::spawn(move || {
+    for _ in 0..10 {
+        let _ = read.read();
+    }
+});
 ```
+## Notes 
+The older `RingBuffer` is deprecated. 
 
-## API
-
-### `RingBuffer::new(buffer_size: usize, length: usize, clear_value: u8)`
-
-Creates a new ring buffer with specified parameters:
-- `buffer_size`: Size of each slot's internal buffer (in bytes)
-- `length`: Number of slots in the ring buffer (must be power of two)
-- `clear_value`: Value to initialize each slot with
-
-### `write<T>(data: T)`
-
-Writes data to the next available slot without clearing the buffer first.
-
-### `write_and_clear<T>(data: T)`
-
-Writes data to the next available slot, clearing the buffer first.
-
-### `read() -> &[u8]`
-
-Reads data from the most recently written slot, ensuring atomicity.
-
-### `read_str() -> String`
-
-Reads data as a UTF-8 string with trailing null bytes trimmed.
-
-## Performance
-
-- Uses 64-byte alignment for improved cache performance
-- Atomic operations for synchronization
-- Fixed size
-- Minimal memory allocations
-- Designed for high-throughput scenarios
-
-## Safety
-
-The implementation uses unsafe code for memory operations but ensures:
-- Thread-safe access through atomic primitives
-- Proper memory layout with alignment
-- Bounds checking during buffer operations
-
-## Note:
-- This buffer is designed for high-throughput scenarios where occasional data loss is acceptable,
-rather than systems requiring guaranteed delivery of every single write.
-- Readers should expect to see the most recently written data, but may miss intermediate writes
-if the writer outpaces the reader.
-
+`BufferedAtomics` is a lot more flexible and performs better.

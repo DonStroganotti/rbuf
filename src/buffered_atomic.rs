@@ -1,21 +1,8 @@
 use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
-    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
-
-#[repr(u8)]
-enum ItemStatus {
-    Accessible = 0,
-    Writing = 1 << 0,
-    Reading = 1 << 1,
-}
-
-impl From<ItemStatus> for u8 {
-    fn from(value: ItemStatus) -> Self {
-        value as u8
-    }
-}
 
 /// Stores the data for the ring buffer
 #[repr(align(64))]
@@ -24,10 +11,10 @@ where
     T: Clone,
 {
     value: UnsafeCell<std::mem::MaybeUninit<T>>,
-    /// This used as a bitfield for ItemStatus
-    status: AtomicU8,
-    /// set to true when value has been initialized
-    initialized: UnsafeCell<bool>,
+    /// Sequence
+    /// uneven = writing
+    /// > 0 = initialized
+    seq: AtomicUsize,
 }
 
 unsafe impl<T: Clone> Send for AtomicItem<T> {}
@@ -40,8 +27,7 @@ where
     pub fn new() -> Self {
         Self {
             value: UnsafeCell::new(MaybeUninit::uninit()),
-            status: AtomicU8::new(ItemStatus::Accessible.into()),
-            initialized: UnsafeCell::new(false),
+            seq: AtomicUsize::new(0),
         }
     }
 
@@ -49,13 +35,18 @@ where
     ///
     /// Returns the value: T on error
     pub fn try_write(&self, value: T) -> Result<(), T> {
-        // Try to acqurie this item for write access
-        let result = self.status.compare_exchange(
-            ItemStatus::Accessible.into(),
-            ItemStatus::Writing.into(),
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        );
+        // Try to acquire this item for write access
+        let seq = self.seq.load(Ordering::Acquire);
+
+        // If sequence is uneven there's another writer already accessing this item
+        if seq & 1 != 0 {
+            return Err(value);
+        }
+
+        // try to get write access by attempting to increment to an uneven value
+        let result = self
+            .seq
+            .compare_exchange(seq, seq + 1, Ordering::AcqRel, Ordering::Relaxed);
 
         // Failed to lock for writing
         if result.is_err() {
@@ -63,64 +54,49 @@ where
         }
 
         // SAFETY: we only modify the item if the compare_exchange is successful,
-        // which guarantees that no other reader or writer will be accessing it
+        // which guarantees that no other writer will be accessing it
 
         // If item has already been initialized we need to drop old value before writing new
-        if unsafe { *self.initialized.get() } {
-            unsafe {
-                (*self.value.get()).assume_init_drop();
-            };
-        }
-
-        // Write data to item
         unsafe {
+            // if sequence is > 0 the item has been initialized
+            // TODO: if sequence wraps around back to 0 this will cause an issue
+            if seq != 0 {
+                (*self.value.get()).assume_init_drop();
+            }
+
+            // Write data to item
             (*self.value.get()).write(value);
         }
-        // mark as initialized
 
-        unsafe { *self.initialized.get() = true }
-
-        // restore status to be accessible
-        self.status
-            .store(ItemStatus::Accessible.into(), Ordering::Relaxed);
+        // Complete write by setting seq to an even value
+        self.seq.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
 
     /// Tries to write the value, returns Ok on success
     pub fn try_read(&self) -> Option<T> {
-        // Try to acquire this item for read access
-        let result = self.status.compare_exchange(
-            ItemStatus::Accessible.into(),
-            ItemStatus::Reading.into(),
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        );
+        // Check if a writer is currently writing to this
+        let seq = self.seq.load(Ordering::Acquire);
 
-        // Failed to lock for writing
-        if result.is_err() {
+        // The value has to be initialized and not currently being written to,
+        // otherwise we can't return anything
+        if seq & 1 != 0 || seq == 0 {
             return None;
         }
 
-        // The value has to be initialized, otherwise we can't return anything
-        if unsafe { !*self.initialized.get() } {
-            // restore status to be accessible
-            self.status
-                .store(ItemStatus::Accessible.into(), Ordering::Relaxed);
-            return None;
+        unsafe {
+            let ret = (*self.value.get()).assume_init_ref().clone();
+
+            let seq2 = self.seq.load(Ordering::Acquire);
+
+            if seq != seq2 {
+                return None;
+            }
+
+            // SAFETY: we only return a value if the seq hasn't changed from before and after read
+            Some(ret)
         }
-
-        // SAFETY: we only read the value if the compare_exchange is successful,
-        // which guarantees that no other reader or writer will be accessing it
-
-        let ret = unsafe { (*self.value.get()).assume_init_ref().clone() };
-
-        // restore status to be accessible
-        self.status
-            .store(ItemStatus::Accessible.into(), Ordering::Relaxed);
-
-        // Write data to item
-        Some(ret)
     }
 }
 

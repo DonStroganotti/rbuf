@@ -4,14 +4,15 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use rbuf::BufferedAtomic;
 use rbuf::RingBuffer;
 
 fn main() {
-    let write_thread_count = 2;
-    let read_thread_count = 2;
+    let write_thread_count = 1;
+    let read_thread_count = 1;
 
     // RingBuffer parameters
     let slot_count = 16;
@@ -23,7 +24,8 @@ fn main() {
     let write_counter = Arc::new(AtomicUsize::new(0));
     let read_counter = Arc::new(AtomicUsize::new(0));
 
-    let rbuf_write = Arc::new(RingBuffer::new(buffer_size, slot_count, 0));
+    // let rbuf_write = Arc::new(RingBuffer::new(buffer_size, slot_count, 0));
+    let rbuf_write = Arc::new(BufferedAtomic::new(slot_count));
     let rbuf_read = rbuf_write.clone();
 
     for _ in 0..write_thread_count {
@@ -32,7 +34,7 @@ fn main() {
         let write_data = write_data.clone();
         thread::spawn(move || {
             loop {
-                rbuf_write.write(&write_data);
+                rbuf_write.write(write_data.clone());
                 write_counter.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -44,7 +46,8 @@ fn main() {
         thread::spawn(move || {
             let mut out_buff = vec![0; buffer_size];
             loop {
-                rbuf_read.read_to_buf(&mut out_buff);
+                // rbuf_read.read_to_buf(&mut out_buff);
+                let _ = rbuf_read.read();
                 read_counter.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -60,6 +63,8 @@ fn main() {
             let mut writes_str = format!("{}", writes);
             if writes > 1e6 as usize {
                 writes_str = format!("{:.2}M", writes as f64 / 1e6_f64);
+            } else if writes > 1e3 as usize {
+                writes_str = format!("{:.2}K", writes as f64 / 1e3_f64);
             }
 
             let reads = read_counter.load(Ordering::Relaxed);

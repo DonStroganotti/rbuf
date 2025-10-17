@@ -1,6 +1,6 @@
 # rbuf — Buffered Atomics (Lock-Free Concurrent Buffer)
 
-A high-performance, lock-free buffering library for Rust, designed for concurrent access with minimal overhead and flexible usage patterns.
+Lock-free, high-performance ring buffer. Reads are non-deterministic: only the latest value is guaranteed, intermediate writes may be lost.
 
 ## Overview
 

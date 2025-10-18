@@ -15,6 +15,8 @@ where
     /// uneven = writing
     /// > 0 = initialized
     seq: AtomicUsize,
+    #[cfg(test)]
+    drop_count: AtomicUsize,
 }
 
 unsafe impl<T: Clone> Send for AtomicItem<T> {}
@@ -28,6 +30,8 @@ where
         Self {
             value: UnsafeCell::new(MaybeUninit::uninit()),
             seq: AtomicUsize::new(0),
+            #[cfg(test)]
+            drop_count: AtomicUsize::new(0),
         }
     }
 
@@ -43,10 +47,13 @@ where
             return Err(value);
         }
 
+        // if we are about to overflow seq, skip 0 index or the value won't be dropped in the unsafe section
+        let new_seq = if seq != usize::MAX - 1 { seq + 1 } else { 1 };
+
         // try to get write access by attempting to increment to an uneven value
         let result = self
             .seq
-            .compare_exchange(seq, seq + 1, Ordering::AcqRel, Ordering::Relaxed);
+            .compare_exchange(seq, new_seq, Ordering::AcqRel, Ordering::Relaxed);
 
         // Failed to lock for writing
         if result.is_err() {
@@ -59,8 +66,10 @@ where
         // If item has already been initialized we need to drop old value before writing new
         unsafe {
             // if sequence is > 0 the item has been initialized
-            // TODO: if sequence wraps around back to 0 this will cause an issue
             if seq != 0 {
+                #[cfg(test)]
+                self.drop_count.fetch_add(1, Ordering::SeqCst);
+                // drop the value because it has already been initialized
                 (*self.value.get()).assume_init_drop();
             }
 
@@ -191,6 +200,25 @@ mod tests {
     }
 
     #[test]
+    fn test_seq_overflow() {
+        let value: AtomicItem<usize> = AtomicItem::new();
+        let _ = value.try_write(5); // initial value
+        let _ = value.try_write(5); // initial value should drop here
+        assert_eq!(value.drop_count.load(Ordering::SeqCst), 1);
+
+        value.seq.store(usize::MAX - 1, Ordering::SeqCst);
+
+        assert_eq!(value.seq.load(Ordering::SeqCst), usize::MAX - 1);
+
+        // check if values keep being dropped correctly on wrap around
+        let _ = value.try_write(10);
+        assert_eq!(value.drop_count.load(Ordering::SeqCst), 2);
+        let _ = value.try_write(15);
+        assert_eq!(value.drop_count.load(Ordering::SeqCst), 3);
+        assert_eq!(value.try_read(), Some(15));
+    }
+
+    #[test]
     fn test_item_multiple_read() {
         let value: AtomicItem<String> = AtomicItem::new();
 
@@ -217,24 +245,26 @@ mod tests {
 
     #[test]
     fn test_read_write_thread() {
-        let buffer = Arc::new(BufferedAtomic::new(4));
+        let buffer = Arc::new(BufferedAtomic::<String>::new(4));
 
         let write = buffer.clone();
         let read = buffer.clone();
 
         let wh = thread::spawn(move || {
-            for i in 0..10 {
+            for i in 0..10000 {
                 write.write(format!("Hello reader: {i}"));
             }
+            write.write("Final value 🚂".to_string());
         });
 
         let rh = thread::spawn(move || {
-            for _ in 0..10 {
+            for _ in 0..1000 {
                 let _ = read.read();
             }
         });
 
-        wh.join().unwrap();
-        rh.join().unwrap();
+        while !wh.is_finished() || !rh.is_finished() {}
+
+        assert_eq!(buffer.read(), format!("Final value 🚂"))
     }
 }

@@ -4,7 +4,7 @@ Lock-free, high-performance ring buffer. Reads are non-deterministic: only the l
 
 ## Overview
 
-`BufferedAtomics` is a simple, fast, and versatile lock-free buffer implementation for concurrent producers and consumers.  
+`BufferedAtomic` is a simple, fast, and versatile lock-free buffer implementation for concurrent producers and consumers.  
 It provides atomic read/write access with minimal synchronization overhead, making it ideal for high-throughput systems such as telemetry, streaming, and logging.
 
 ---

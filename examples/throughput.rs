@@ -7,8 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rbuf::BufferedAtomic;
-use rbuf::RingBuffer;
+use rbuf::{BufferedAtomic, BufferedAtomicSeq};
 
 fn main() {
     let write_thread_count = 2;
@@ -25,7 +24,7 @@ fn main() {
     let read_counter = Arc::new(AtomicUsize::new(0));
 
     // let rbuf_write = Arc::new(RingBuffer::new(buffer_size, slot_count, 0));
-    let rbuf_write = Arc::new(BufferedAtomic::new(slot_count));
+    let rbuf_write = Arc::new(BufferedAtomicSeq::new(slot_count));
     let rbuf_read = rbuf_write.clone();
 
     for _ in 0..write_thread_count {
@@ -34,8 +33,10 @@ fn main() {
         let write_data = write_data.clone();
         thread::spawn(move || {
             loop {
-                rbuf_write.write(write_data.clone());
-                write_counter.fetch_add(1, Ordering::Relaxed);
+                let res = rbuf_write.write(1);
+                if res.is_ok() {
+                    write_counter.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
     }
@@ -47,8 +48,10 @@ fn main() {
             let mut out_buff = vec![0; buffer_size];
             loop {
                 // rbuf_read.read_to_buf(&mut out_buff);
-                let _ = rbuf_read.read();
-                read_counter.fetch_add(1, Ordering::Relaxed);
+                let res = rbuf_read.read();
+                if res.is_some() {
+                    read_counter.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
     }

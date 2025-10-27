@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::AtomicItem;
 
+#[derive(Debug, Default)]
 pub struct BufferedAtomic<T>
 where
     T: Clone,

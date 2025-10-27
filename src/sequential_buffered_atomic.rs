@@ -9,6 +9,7 @@ use crate::{BufferedAtomic, atomic_item::AtomicItem};
 /// It guarantees that all writes and reads will happen in order, and no data will be lost.
 ///
 /// This also means that if writers outpace readers they will have to wait before they can write new data
+#[derive(Debug, Default)]
 pub struct BufferedAtomicSeq<T: Clone> {
     ringbuffer: Vec<AtomicItem<T>>,
 

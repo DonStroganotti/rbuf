@@ -8,6 +8,7 @@ use std::{
 
 /// Stores the data for the ring buffer
 #[repr(align(64))]
+#[derive(Debug)]
 pub struct AtomicItem<T>
 where
     T: Clone,
@@ -82,7 +83,7 @@ where
             if seq != 0 {
                 #[cfg(test)]
                 self.drop_count.fetch_add(1, Ordering::SeqCst);
-                // drop the value because it has already been initialized
+                // drop the value
                 (*self.value.get()).assume_init_drop();
             }
 
